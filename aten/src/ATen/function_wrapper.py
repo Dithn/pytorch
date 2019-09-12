@@ -145,6 +145,21 @@ inline ${return_type} Tensor::${api_name}(${method_formals}) const {
 #endif
 }
 """)
+C10_TENSOR_METHOD_DEFINITION = CodeTemplate("""\
+inline ${return_type} Tensor::${api_name}(${method_formals}) const {
+#ifdef USE_STATIC_DISPATCH
+    ${static_dispatch_method_body}
+#else
+    static c10::OperatorHandle op = c10::Dispatcher::singleton().findSchema({"aten::${name}", "${overload_name}"}).value();
+    if (is_variable()) {
+        return c10::Dispatcher::singleton().callUnboxedAutogradKernel<${formals_types_with_return}>(op, ${method_actuals});
+    } else {
+        return c10::Dispatcher::singleton().lookup(op, impl::dispatchTypeId(type_set()))
+            .callUnboxed<${formals_types_with_return}>(${method_actuals});
+    }
+#endif
+}
+""")
 # add a method declaration in Functions.h
 FUNCTION_DECLARATION = CodeTemplate("""\
 static inline ${return_type} ${api_name}(${formals_with_defaults});
@@ -161,6 +176,24 @@ static inline ${return_type} ${api_name}(${formals}) {
 #else
     static auto table = globalATenDispatch().getOpTable("${schema_string}");
     return table->getOp<${return_type} (${formals_types})>(${inferred_type_set}, ${inferred_is_variable})(${native_actuals});
+#endif
+}
+""")
+
+C10_FUNCTION_DEFINITION = CodeTemplate("""\
+static inline ${return_type} ${api_name}(${formals}) {
+#ifdef USE_STATIC_DISPATCH
+    ${static_dispatch_function_body}
+#else
+    static c10::OperatorHandle op = c10::Dispatcher::singleton()
+        .findSchema({"aten::${name}", "${overload_name}"}).value();
+    if (${inferred_is_variable}) {
+        return c10::Dispatcher::singleton().callUnboxedAutogradKernel<${formals_types_with_return}>(
+            op ${native_actuals_with_comma_prefix});
+    } else {
+        return c10::Dispatcher::singleton().lookup(op, impl::dispatchTypeId(${inferred_type_set}))
+            .callUnboxed<${formals_types_with_return}>(${native_actuals});
+    }
 #endif
 }
 """)
@@ -563,6 +596,7 @@ FunctionOption = TypedDict('FunctionOption', {
     'formals_with_defaults': List[str],
     'formals': List[str],
     'formals_types': List[str],
+    'formals_types_with_return': List[str],
     'inferred_type_set': str,
     'inferred_is_variable': str,
     'inplace': bool,
@@ -581,6 +615,7 @@ FunctionOption = TypedDict('FunctionOption', {
     'operator_name': str,
     'overload_name': str,
     'native_actuals': List[str],
+    'native_actuals_with_comma_prefix': str,
     'native_type_method_dispatch': str,
     # options should be List[FunctionOption]
     'options': Any,
@@ -1087,6 +1122,14 @@ def create_generic(top_env, declarations):
 
         option['formals_types'] = [f['type'] for f in option['formals_list']]
         option['native_actuals'] = [f['name'] for f in option['formals_list']]
+        if len(option['native_actuals']) == 0:
+            option['native_actuals_with_comma_prefix'] = ''
+        else:
+            option['native_actuals_with_comma_prefix'] = ', ' + ', '.join(option['native_actuals'])
+
+        option['formals_types_with_return'] = [option['return_type']]
+        if len(option['formals_types']) > 0:
+            option['formals_types_with_return'].extend(option['formals_types'])
 
         option['method_formals'] = [format_formal(f) for f in formals
                                     if f['name'] != 'self']
@@ -1129,9 +1172,18 @@ def create_generic(top_env, declarations):
                 static_dispatch_method_body = STATIC_DISPATCH_FUNCTION_DEFAULT_BODY.substitute(
                     option, native_arguments=option['method_actuals'])
 
-            return FunctionCode(
-                declaration=TENSOR_METHOD_DECLARATION.substitute(option, static_dispatch_method_body=static_dispatch_method_body),
-                definition=TENSOR_METHOD_DEFINITION.substitute(option, static_dispatch_method_body=static_dispatch_method_body))
+            if not option['use_c10_dispatcher']:
+                return FunctionCode(
+                    declaration=TENSOR_METHOD_DECLARATION.substitute(
+                        option, static_dispatch_method_body=static_dispatch_method_body),
+                    definition=TENSOR_METHOD_DEFINITION.substitute(
+                        option, static_dispatch_method_body=static_dispatch_method_body))
+            else:
+                return FunctionCode(
+                    declaration=TENSOR_METHOD_DECLARATION.substitute(
+                        option, static_dispatch_method_body=static_dispatch_method_body),
+                    definition=C10_TENSOR_METHOD_DEFINITION.substitute(
+                        option, static_dispatch_method_body=static_dispatch_method_body))
 
         def gen_namespace_function(option, dispatch_tensor, dispatch_options):
             # type: (Any, Optional[str], Any) -> FunctionCode
@@ -1167,9 +1219,15 @@ def create_generic(top_env, declarations):
                     option, native_arguments=option['native_actuals'])
 
             if is_factory_method:
-                fn_definition = FACTORY_DEFINITION.substitute(option, static_dispatch_function_body=static_dispatch_function_body)
+                fn_definition = FACTORY_DEFINITION.substitute(
+                    option, static_dispatch_function_body=static_dispatch_function_body)
             else:
-                fn_definition = FUNCTION_DEFINITION.substitute(option, static_dispatch_function_body=static_dispatch_function_body)
+                if not option['use_c10_dispatcher']:
+                    fn_definition = FUNCTION_DEFINITION.substitute(
+                        option, static_dispatch_function_body=static_dispatch_function_body)
+                else:
+                    fn_definition = C10_FUNCTION_DEFINITION.substitute(
+                        option, static_dispatch_function_body=static_dispatch_function_body)
             return FunctionCode(definition=fn_definition, declaration=fn_declaration)
 
         # Emit #ifdef BUILD_NAMEDTENSOR macros for any code generated here
@@ -1203,6 +1261,10 @@ def create_generic(top_env, declarations):
         option['type_method_formals'] = [format_formal(f) for f in formals]
         option['type_method_actuals'] = [f['name'] for f in formals]
         option['native_actuals'] = [f['name'] for f in formals]
+        if len(option['native_actuals']) == 0:
+            option['native_actuals_with_comma_prefix'] = ''
+        else:
+            option['native_actuals_with_comma_prefix'] = ', ' + ', '.join(option['native_actuals'])
 
         is_method = 'method' in option['variants']
         is_namespace_function = 'function' in option['variants']
